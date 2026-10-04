@@ -39,6 +39,7 @@ pairing and control protocols, so the same app pairs either.
 | `link_client.py` | One session: `/v1/noise` upgrade, Noise XX, `/link-control`, `/chat/stream` |
 | `service.py` | `musegadget run`: reconnect loop, token rotation, local socket |
 | `executor.py`, `fileops.py` | The commands Muse can run, as the chosen account |
+| `tts/` | Spoken replies: `TTSProvider` (espeak), `AudioOutput` (ALSA/aplay), `TTSManager` |
 | `noise/` | Noise XX handshake, framing and service envelopes |
 | `data/` | The systemd unit and the hash-pinned `requirements.lock`, shipped in the package |
 
@@ -153,8 +154,11 @@ A healthy start logs `commands run as <user>`, `Noise session established`,
   `POST /chat/stream` requests on the same session, with `device_id` set to the
   node id and `"output_modality": "text"`. `session_id` picks the chat;
   `chat_id` is not an API field and is ignored. The response is only the ack
-  (`message_id`); the reply appears in the Muse chat. Replies are text: to
-  speak them, use a text-to-speech API of your choice.
+  (`message_id`); the reply appears in the Muse chat and over `/chat/subscribe`.
+  When spoken replies are enabled (`--tts` or `MUSEGADGET_TTS_ENABLED=1`),
+  the Linux client receives `delta.message_done` or `message.assistant` and speaks
+  the text response via the configured offline TTS provider (such as `espeak-ng` or
+  `piper`) and audio output (`aplay`).
 - The VM accepts at most 256 KB per message from the device, so command output
   is cut at 96 KB per stream.
 

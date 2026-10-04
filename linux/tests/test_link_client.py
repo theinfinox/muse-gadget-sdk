@@ -24,7 +24,7 @@ from musegadget.link_client import (
     DeviceDescription, LinkSession, MessageDecoder, Outcome, encode_message, noise_url,
 )
 from musegadget.noise import (
-    ApplicationResponse, BodyChunk, NoiseFrameDecoder, NoiseXXResponder, ServiceFrame,
+    ApplicationResponse, BodyChunk, NoiseFrameDecoder, NoiseXXResponder, Reset, ServiceFrame,
     encode_noise_frames,
 )
 from musegadget.noise.transport import decode_request_envelope, encode_response_envelope
@@ -103,7 +103,7 @@ class FakeVm:
         ))
 
 
-def make_session(run_command, connect_log: list):
+def make_session(run_command, connect_log: list, on_response=None):
     to_device, to_vm = asyncio.Queue(), asyncio.Queue()
     device_ws, vm_ws = Pipe(to_device, to_vm), Pipe(to_vm, to_device)
 
@@ -113,7 +113,7 @@ def make_session(run_command, connect_log: list):
 
     session = LinkSession(
         noise_host="gw.example", vm_id="vm 1&x", vm_auth_token="tok",
-        device=DEVICE, run_command=run_command, connect=connect,
+        device=DEVICE, run_command=run_command, on_response=on_response, connect=connect,
     )
     return session, FakeVm(vm_ws)
 
@@ -227,5 +227,227 @@ def test_send_chat_posts_a_device_attributed_message_on_the_same_session():
         assert await asyncio.wait_for(reply, 2) == {
             "ok": True, "status": 200, "response": {"accepted": True}}
         task.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_response_event_triggers_on_response():
+    async def scenario():
+        responses = []
+        session, vm = make_session(lambda *a: {"ok": True}, [], on_response=responses.append)
+        task = asyncio.ensure_future(session.run(asyncio.Event()))
+        await vm.handshake()
+        await vm.accept_control_stream()
+        register = await vm.next_message()
+        await vm.send_message({"type": "res", "id": register["id"], "ok": True})
+
+        # Send a delta.message_done event
+        await vm.send_message({
+            "type": "event",
+            "event": "delta.message_done",
+            "payload": {
+                "message_id": "msg-001",
+                "display_text": "The garage door is closed.",
+                "display_text_ready": True,
+            },
+        })
+
+        for _ in range(10):
+            if responses:
+                break
+            await asyncio.sleep(0.02)
+
+        assert responses == ["The garage door is closed."]
+        task.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_response_event_deduplicates_by_message_id():
+    async def scenario():
+        responses = []
+        session, vm = make_session(lambda *a: {"ok": True}, [], on_response=responses.append)
+        task = asyncio.ensure_future(session.run(asyncio.Event()))
+        await vm.handshake()
+        await vm.accept_control_stream()
+        register = await vm.next_message()
+        await vm.send_message({"type": "res", "id": register["id"], "ok": True})
+
+        # Send delta.message_done
+        await vm.send_message({
+            "type": "event",
+            "event": "delta.message_done",
+            "payload": {
+                "message_id": "msg-dup",
+                "display_text": "Hello again",
+                "display_text_ready": True,
+            },
+        })
+
+        # Send message.assistant with same message_id
+        await vm.send_message({
+            "type": "event",
+            "event": "message.assistant",
+            "payload": {
+                "message_id": "msg-dup",
+                "display_text": "Hello again",
+                "content": "Hello again",
+            },
+        })
+
+        await asyncio.sleep(0.05)
+        # Should only have been received once due to deduplication
+        assert responses == ["Hello again"]
+        task.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_response_event_ignores_not_ready():
+    async def scenario():
+        responses = []
+        session, vm = make_session(lambda *a: {"ok": True}, [], on_response=responses.append)
+        task = asyncio.ensure_future(session.run(asyncio.Event()))
+        await vm.handshake()
+        await vm.accept_control_stream()
+        register = await vm.next_message()
+        await vm.send_message({"type": "res", "id": register["id"], "ok": True})
+
+        await vm.send_message({
+            "type": "event",
+            "event": "delta.message_done",
+            "payload": {
+                "message_id": "msg-notready",
+                "display_text": "Partial text",
+                "display_text_ready": False,
+            },
+        })
+
+        await asyncio.sleep(0.05)
+        assert responses == []
+        task.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_subscription_request_terminates_body():
+    async def scenario():
+        responses = []
+        session, vm = make_session(lambda *a: {"ok": True}, [], on_response=responses.append)
+        task = asyncio.ensure_future(session.run(asyncio.Event()))
+        await vm.handshake()
+        await vm.accept_control_stream()
+        register = await vm.next_message()
+        await vm.send_message({"type": "res", "id": register["id"], "ok": True})
+
+        sub_req = await vm.next_frame()
+        assert sub_req.kind == "request"
+        assert sub_req.value.path == "/chat/subscribe"
+        assert sub_req.value.verb == "POST"
+
+        sub_body = await vm.next_frame()
+        assert sub_body.kind == "body_chunk"
+        assert sub_body.value.data == b"{}\n"
+        assert sub_body.value.end_body is True
+
+        task.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_no_subscription_stream_when_on_response_is_none():
+    async def scenario():
+        session, vm = make_session(lambda *a: {"ok": True}, [], on_response=None)
+        task = asyncio.ensure_future(session.run(asyncio.Event()))
+        await vm.handshake()
+        await vm.accept_control_stream()
+        register = await vm.next_message()
+        await vm.send_message({"type": "res", "id": register["id"], "ok": True})
+
+        await asyncio.sleep(0.05)
+        assert vm.ws._outbox.empty()
+        assert session._sub_stream_id is None
+
+        task.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_subscription_reset_and_reconnect():
+    async def scenario():
+        responses = []
+        session, vm = make_session(lambda *a: {"ok": True}, [], on_response=responses.append)
+        task = asyncio.ensure_future(session.run(asyncio.Event()))
+        await vm.handshake()
+        await vm.accept_control_stream()
+        register = await vm.next_message()
+        await vm.send_message({"type": "res", "id": register["id"], "ok": True})
+
+        sub_req1 = await vm.next_frame()
+        sub_body1 = await vm.next_frame()
+        assert sub_body1.value.end_body is True
+        stream_id1 = sub_req1.stream_id
+
+        # VM resets the subscription stream
+        await vm.send_frame(ServiceFrame.reset(
+            stream_id1, Reset(code=1, reason="stream cancelled"),
+        ))
+
+        # Device should detect reset, clear stale stream, and reconnect with new stream id
+        sub_req2 = await asyncio.wait_for(vm.next_frame(), timeout=3.0)
+        assert sub_req2.kind == "request"
+        assert sub_req2.value.path == "/chat/subscribe"
+        assert sub_req2.stream_id != stream_id1
+
+        sub_body2 = await vm.next_frame()
+        assert sub_body2.value.end_body is True
+
+        chunk_data = (
+            b'{"type":"event","event":"delta.message_done","payload":'
+            b'{"message_id":"m1","display_text":"hello after reconnect",'
+            b'"display_text_ready":true}}\n'
+        )
+        await vm.send_frame(ServiceFrame.body_chunk(
+            sub_req2.stream_id,
+            BodyChunk(data=chunk_data),
+        ))
+
+        for _ in range(10):
+            if responses:
+                break
+            await asyncio.sleep(0.02)
+
+        assert responses == ["hello after reconnect"]
+        task.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_subscription_clean_shutdown_while_reconnect_pending():
+    async def scenario():
+        responses = []
+        stop_event = asyncio.Event()
+        session, vm = make_session(lambda *a: {"ok": True}, [], on_response=responses.append)
+        task = asyncio.ensure_future(session.run(stop_event))
+        await vm.handshake()
+        await vm.accept_control_stream()
+        register = await vm.next_message()
+        await vm.send_message({"type": "res", "id": register["id"], "ok": True})
+
+        sub_req = await vm.next_frame()
+        await vm.next_frame()
+
+        # VM resets subscription stream; reconnect delay is 1.0s
+        await vm.send_frame(ServiceFrame.reset(sub_req.stream_id, Reset(code=1, reason="reset")))
+        await asyncio.sleep(0.05)
+
+        assert session._sub_reconnect_task is not None
+        assert not session._sub_reconnect_task.done()
+
+        # Stop session while reconnect is pending
+        stop_event.set()
+        outcome = await asyncio.wait_for(task, timeout=2.0)
+        assert outcome is Outcome.STOPPED
+        assert session._sub_reconnect_task is None
 
     asyncio.run(scenario())

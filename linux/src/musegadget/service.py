@@ -37,6 +37,7 @@ from musegadget import __version__, config, muse_api
 from musegadget.executor import COMMAND_SPECS, Executor
 from musegadget.identity import Identity
 from musegadget.link_client import DeviceDescription, LinkSession, Outcome
+from musegadget.tts import TTSManager
 
 log = logging.getLogger(__name__)
 
@@ -74,6 +75,7 @@ class Service:
     executor: Executor
     sdk_token: str | None = None
     display_name: str = field(default_factory=socket.gethostname)
+    tts: TTSManager | None = None
     _stop: asyncio.Event = field(default_factory=asyncio.Event)
     _last_refresh_attempt: float = float("-inf")
     # The SDK token reaches Muse only in refresh bodies until apps forward it at
@@ -85,46 +87,58 @@ class Service:
         self._stop.set()
 
     async def run(self) -> None:
-        backoff = Backoff()
-        while not self._stop.is_set():
-            pairing = config.load_json(config.PAIRING_FILE)
-            if not pairing:
-                log.info("not paired; run `musegadget pair` to set up")
-                await self._sleep(UNPAIRED_POLL_S)
-                continue
-            pairing = await self._maybe_refresh(pairing)
-            if pairing is None:
-                await self._sleep(TOKEN_RETRY_S)
-                continue
-
-            api = muse_api.api_root(pairing.get("api_url_v2", ""))
-            vms, status = await asyncio.to_thread(
-                muse_api.fetch_vms_with_status, pairing["access_token"], api,
-            )
-            if status == 401:
-                log.warning("device token rejected by the API; refreshing")
-                if await self._maybe_refresh(pairing, force=True) is None:
+        if self.tts is None:
+            self.tts = TTSManager()
+        if self.tts.enabled:
+            await self.tts.start()
+        try:
+            backoff = Backoff()
+            while not self._stop.is_set():
+                pairing = config.load_json(config.PAIRING_FILE)
+                if not pairing:
+                    log.info("not paired; run `musegadget pair` to set up")
+                    await self._sleep(UNPAIRED_POLL_S)
+                    continue
+                pairing = await self._maybe_refresh(pairing)
+                if pairing is None:
                     await self._sleep(TOKEN_RETRY_S)
-                continue
-            vm = next((v for v in vms if v["is_default"]), vms[0] if vms else None)
-            if vm is None:
-                await self._sleep(backoff.next_delay())
-                continue
+                    continue
 
-            outcome, lasted = await self._session(vm, pairing)
-            if outcome is Outcome.STOPPED:
-                return
-            if outcome is Outcome.UNPAIRED:
-                config.delete_json(config.PAIRING_FILE)
-                log.warning("pairing removed; run `musegadget pair` to set up again")
-                continue
-            if lasted >= HEALTHY_SESSION_S:
-                backoff.reset()
-            if outcome in (Outcome.AUTH_REJECTED, Outcome.FORBIDDEN):
-                backoff.floor = AUTH_BACKOFF_MIN_S
-            delay = backoff.next_delay()
-            log.info("reconnecting in %.0fs", delay)
-            await self._sleep(delay)
+                api = muse_api.api_root(pairing.get("api_url_v2", ""))
+                vms, status = await asyncio.to_thread(
+                    muse_api.fetch_vms_with_status, pairing["access_token"], api,
+                )
+                if status == 401:
+                    log.warning("device token rejected by the API; refreshing")
+                    if await self._maybe_refresh(pairing, force=True) is None:
+                        await self._sleep(TOKEN_RETRY_S)
+                    continue
+                vm = next((v for v in vms if v["is_default"]), vms[0] if vms else None)
+                if vm is None:
+                    await self._sleep(backoff.next_delay())
+                    continue
+
+                outcome, lasted = await self._session(vm, pairing)
+                if outcome is Outcome.STOPPED:
+                    return
+                if outcome is Outcome.UNPAIRED:
+                    config.delete_json(config.PAIRING_FILE)
+                    log.warning("pairing removed; run `musegadget pair` to set up again")
+                    continue
+                if lasted >= HEALTHY_SESSION_S:
+                    backoff.reset()
+                if outcome in (Outcome.AUTH_REJECTED, Outcome.FORBIDDEN):
+                    backoff.floor = AUTH_BACKOFF_MIN_S
+                delay = backoff.next_delay()
+                log.info("reconnecting in %.0fs", delay)
+                await self._sleep(delay)
+        finally:
+            if self.tts:
+                await self.tts.stop()
+
+    def _on_response(self, text: str) -> None:
+        if self.tts and self.tts.enabled:
+            self.tts.speak(text)
 
     async def _session(self, vm: dict, pairing: dict) -> tuple[Outcome, float]:
         device = DeviceDescription(
@@ -133,12 +147,14 @@ class Service:
             version=__version__,
             commands=COMMAND_SPECS,
         )
+        on_response = self._on_response if (self.tts and self.tts.enabled) else None
         session = LinkSession(
             noise_host=pairing.get("noise_host") or DEFAULT_NOISE_HOST,
             vm_id=vm["vm_id"] or vm["vm_name"],
             vm_auth_token=vm["vm_auth_token"],
             device=device,
             run_command=self.executor.run,
+            on_response=on_response,
         )
         log.info("connecting to %s", vm["vm_name"] or vm["vm_id"])
         started = time.monotonic()
@@ -235,6 +251,15 @@ class Service:
 
     async def _local_request(self, line: bytes) -> dict:
         request = json.loads(line)
+        if isinstance(request, dict) and "say" in request:
+            say_text = request.get("say")
+            if not isinstance(say_text, str) or not say_text.strip():
+                return {"ok": False, "error": "expected non-empty \"say\" text"}
+            if self.tts:
+                self.tts.speak(say_text)
+                return {"ok": True}
+            return {"ok": False, "error": "TTS is not available"}
+
         message = request.get("message") if isinstance(request, dict) else None
         if not isinstance(message, str) or not message.strip():
             return {"ok": False, "error": "expected {\"message\": \"...\"}"}
@@ -256,9 +281,14 @@ class Service:
             pass
 
 
-def run_service(identity: Identity, executor: Executor, sdk_token: str | None = None) -> None:
+def run_service(
+    identity: Identity,
+    executor: Executor,
+    sdk_token: str | None = None,
+    tts: TTSManager | None = None,
+) -> None:
     async def main() -> None:
-        service = Service(identity=identity, executor=executor, sdk_token=sdk_token)
+        service = Service(identity=identity, executor=executor, sdk_token=sdk_token, tts=tts)
         loop = asyncio.get_running_loop()
         for signum in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(signum, service.stop)

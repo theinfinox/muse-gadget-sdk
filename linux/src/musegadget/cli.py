@@ -39,7 +39,9 @@ class _SystemNetwork:
     current_connection_entry = staticmethod(network.current_connection_entry)
 
 
-def _verify_and_save(credentials: Credentials, commit: Callable[[Callable[[], bool]], bool]) -> None:
+def _verify_and_save(
+    credentials: Credentials, commit: Callable[[Callable[[], bool]], bool],
+) -> None:
     api_url = credentials.api_url if credentials.api_url.startswith("https://") else ""
     api_url_v2 = credentials.api_url_v2 if credentials.api_url_v2.startswith("https://") else ""
     vms, status = muse_api.fetch_vms_with_status(
@@ -139,6 +141,7 @@ def cmd_pair(args: argparse.Namespace) -> int:
 def cmd_run(args: argparse.Namespace) -> int:
     from musegadget.executor import Account, Executor
     from musegadget.service import run_service
+    from musegadget.tts import TTSConfig, TTSManager
 
     if os.geteuid() == 0:
         if not args.run_as:
@@ -158,8 +161,18 @@ def cmd_run(args: argparse.Namespace) -> int:
     except ValueError as exc:
         log.warning("running without an SDK token: %s", exc)
         sdk_token = None
+
+    tts_cfg = TTSConfig.load()
+    if args.tts is not None:
+        tts_cfg.enabled = args.tts
+    if getattr(args, "tts_provider", None):
+        tts_cfg.provider = args.tts_provider
+    tts_manager = TTSManager(config=tts_cfg)
+
     log.info("musegadget %s: commands run as %s", __version__, account.name)
-    run_service(identity.load_or_create(), Executor(account), sdk_token)
+    if tts_manager.enabled:
+        log.info("spoken replies (TTS) enabled with provider %r", tts_manager.provider.name)
+    run_service(identity.load_or_create(), Executor(account), sdk_token, tts=tts_manager)
     return 0
 
 
@@ -187,13 +200,69 @@ def cmd_send_user_msg(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_say(args: argparse.Namespace) -> int:
+    from musegadget.tts import (
+        AudioOutputError,
+        TTSError,
+        TTSConfig,
+        TTSManager,
+        create_audio_output,
+        create_tts_provider,
+    )
+
+    message = sys.stdin.read() if args.message == ["-"] else " ".join(args.message)
+    if not message.strip():
+        print("No text to speak.", file=sys.stderr)
+        return 1
+
+    cfg = TTSConfig.load()
+    if getattr(args, "provider", None):
+        cfg.provider = args.provider
+    if getattr(args, "voice", None):
+        cfg.voice = args.voice
+    if getattr(args, "device", None):
+        cfg.audio_device = args.device
+
+    provider = create_tts_provider(cfg)
+    output = create_audio_output(cfg)
+
+    if not provider.is_available():
+        print(f"TTS provider {provider.name!r} is not installed or available.", file=sys.stderr)
+        print("Install it with: sudo apt install espeak-ng", file=sys.stderr)
+        return 1
+
+    if not output.is_available():
+        print(f"Audio output {output.name!r} is not available.", file=sys.stderr)
+        print("Install alsa-utils: sudo apt install alsa-utils", file=sys.stderr)
+        return 1
+
+    manager = TTSManager(config=cfg, provider=provider, output=output)
+    try:
+        manager.speak_sync(message)
+    except (TTSError, AudioOutputError) as exc:
+        print(f"Failed to speak: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_info(args: argparse.Namespace) -> int:
+    from musegadget.tts import TTSConfig, create_audio_output, create_tts_provider
+
     ident = identity.load_or_create()
     paired = config.load_json(config.PAIRING_FILE) is not None
+    tts_cfg = TTSConfig.load()
+    provider = create_tts_provider(tts_cfg)
+    output = create_audio_output(tts_cfg)
+
     print(f"version:   {__version__}")
     print(f"node id:   {ident.node_id}")
     print(f"BLE name:  {ident.ble_name}")
     print(f"paired:    {'yes' if paired else 'no'}")
+    prov_status = "available" if provider.is_available() else "not installed"
+    audio_status = "available" if output.is_available() else "not available"
+    print(f"TTS:       {'enabled' if tts_cfg.enabled else 'disabled'}")
+    print(f"provider:  {provider.name} ({prov_status})")
+    print(f"audio:     {output.name} ({audio_status})")
     return 0
 
 
@@ -220,12 +289,26 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("MUSEGADGET_RUN_AS") or os.environ.get("SUDO_USER"),
         help="account whose permissions commands run with (default: the account that ran sudo)",
     )
+    run.add_argument("--tts", dest="tts", action="store_true", default=None,
+                     help="enable spoken voice replies (TTS)")
+    run.add_argument("--no-tts", dest="tts", action="store_false",
+                     help="disable spoken voice replies")
+    run.add_argument("--tts-provider", help="TTS provider to use (default: espeak)")
     run.set_defaults(func=cmd_run)
+
+    say = sub.add_parser("say", help="speak text through the configured audio output")
+    say.add_argument("message", nargs="+", help="the text to speak, or - to read from stdin")
+    say.add_argument("--provider", help="TTS provider (default: espeak)")
+    say.add_argument("--voice", help="voice name (e.g. en, en-us)")
+    say.add_argument("--device", help="audio output device (e.g. default, hw:0,0)")
+    say.set_defaults(func=cmd_say)
 
     send = sub.add_parser("send-user-msg", help="send a message to your Muse from this device")
     send.add_argument("message", nargs="+", help="the message, or - to read it from stdin")
-    send.add_argument("--session-id",
-                     help="send to this side chat (a new id starts one) instead of the main chat")
+    send.add_argument(
+        "--session-id",
+        help="send to this side chat (a new id starts one) instead of the main chat",
+    )
     send.set_defaults(func=cmd_send_user_msg)
 
     sub.add_parser("info", help="show device identity").set_defaults(func=cmd_info)
@@ -237,3 +320,7 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

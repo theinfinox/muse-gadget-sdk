@@ -49,6 +49,7 @@ log = logging.getLogger(__name__)
 NOISE_PATH = "/v1/noise"
 CONTROL_PATH = "/link-control"
 CHAT_PATH = "/chat/stream"
+SUBSCRIBE_PATH = "/chat/subscribe"
 APP_ID = "musegadget"
 REQUEST_TIMEOUT_S = 60
 MAX_RESPONSE_BYTES = 1024 * 1024
@@ -138,17 +139,23 @@ class LinkSession:
         vm_auth_token: str,
         device: DeviceDescription,
         run_command: Callable[[str, dict, int | None], dict],
+        on_response: Callable[[str], None] | None = None,
         connect=None,
     ) -> None:
         self._url = noise_url(noise_host, vm_id)
         self._token = vm_auth_token
         self._device = device
         self._run_command = run_command
+        self._on_response = on_response
         self._connect = connect
         self._send_lock = asyncio.Lock()
         self._invokes = asyncio.Semaphore(MAX_CONCURRENT_INVOKES)
         self._tasks: set[asyncio.Task] = set()
         self._stream_id = 0
+        self._sub_stream_id: int | None = None
+        self._sub_buf = bytearray()
+        self._sub_reconnect_task: asyncio.Task | None = None
+        self._seen_messages: set[str] = set()
         self._register_id = ""
         self._requests: dict[int, _Request] = {}
         self.registered_at: float | None = None
@@ -172,6 +179,12 @@ class LinkSession:
             stopper.cancel()
             return reader.result()
         finally:
+            if self._sub_reconnect_task is not None:
+                self._sub_reconnect_task.cancel()
+                self._sub_reconnect_task = None
+            self._sub_stream_id = None
+            self._sub_buf.clear()
+            self._seen_messages.clear()
             for task in self._tasks:
                 task.cancel()
             for request in self._requests.values():
@@ -233,6 +246,59 @@ class LinkSession:
             "params": self._device.register_params(),
         })
         log.info("sent link.register as %s", self._device.node_id)
+
+    def _schedule_sub_reconnect(self, delay: float = 1.0) -> None:
+        if self._on_response is None or self.registered_at is None:
+            return
+        if self._sub_stream_id is not None:
+            return
+        if self._sub_reconnect_task is not None and not self._sub_reconnect_task.done():
+            return
+        task = asyncio.ensure_future(self._reconnect_subscribe(delay))
+        self._sub_reconnect_task = task
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _reconnect_subscribe(self, delay: float) -> None:
+        try:
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if (
+                self._on_response is not None
+                and self.registered_at is not None
+                and self._sub_stream_id is None
+            ):
+                await self._open_subscribe_stream()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if self._sub_reconnect_task is asyncio.current_task():
+                self._sub_reconnect_task = None
+
+    async def _open_subscribe_stream(self) -> None:
+        if self._on_response is None:
+            return
+        try:
+            encrypted = self._transport.start_stream_request(
+                "POST",
+                SUBSCRIBE_PATH,
+                headers=[
+                    Header("Content-Type", "application/json"),
+                    Header("Accept", "application/x-ndjson"),
+                    Header("x-app-id", APP_ID),
+                ],
+            )
+            self._sub_stream_id = encrypted.stream_id
+            await self._send_frames(encrypted.frames)
+            body_frames = self._transport.encrypt_body_chunk(
+                self._sub_stream_id, b"{}\n", end_body=True
+            )
+            await self._send_frames(body_frames)
+            log.info("opened chat subscription stream (%d)", self._sub_stream_id)
+        except Exception as exc:
+            log.warning("could not open chat subscription stream: %s", exc)
+            self._sub_stream_id = None
+            self._schedule_sub_reconnect(delay=2.0)
 
     # -- Device-originated requests -------------------------------------------
 
@@ -300,6 +366,19 @@ class LinkSession:
             if frame is None:
                 continue
             if frame.stream_id != self._stream_id:
+                if self._sub_stream_id is not None and frame.stream_id == self._sub_stream_id:
+                    if frame.kind == "reset":
+                        log.warning("chat subscription stream reset: %s", frame.value.reason)
+                        self._sub_stream_id = None
+                        self._schedule_sub_reconnect(delay=1.0)
+                        continue
+                    data = frame.value.body if frame.kind == "response" else frame.value.data
+                    self._feed_sub_bytes(data)
+                    if frame.value.end_body:
+                        log.info("chat subscription stream ended by VM")
+                        self._sub_stream_id = None
+                        self._schedule_sub_reconnect(delay=1.0)
+                    continue
                 self._requests.get(frame.stream_id, _NO_REQUEST).on_frame(frame)
                 continue
             if frame.kind == "reset":
@@ -320,6 +399,52 @@ class LinkSession:
                 log.info("control stream ended by VM")
                 return Outcome.CLOSED
 
+    def _feed_sub_bytes(self, data: bytes) -> None:
+        self._sub_buf += data
+        while b"\n" in self._sub_buf:
+            line, self._sub_buf = self._sub_buf.split(b"\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+                if isinstance(msg, dict):
+                    self._handle_event_message(msg)
+            except json.JSONDecodeError:
+                log.warning("dropping malformed chat event line")
+
+    def _handle_event_message(self, message: dict) -> None:
+        event = message.get("event") or message.get("event_name")
+        if event not in ("delta.message_done", "message.assistant"):
+            return
+
+        payload = message.get("payload")
+        if not isinstance(payload, dict):
+            payload = message
+
+        if payload.get("display_text_ready") is False:
+            return
+
+        msg_id = payload.get("message_id") or payload.get("id") or message.get("id")
+        if msg_id and str(msg_id) in self._seen_messages:
+            return
+
+        text = payload.get("display_text") or payload.get("content") or payload.get("text")
+        if not text or not isinstance(text, str) or not text.strip():
+            return
+
+        if msg_id:
+            self._seen_messages.add(str(msg_id))
+            if len(self._seen_messages) > 100:
+                self._seen_messages.pop()
+
+        log.info("received completed text response (%d chars)", len(text))
+        if self._on_response:
+            try:
+                self._on_response(text)
+            except Exception as exc:
+                log.warning("error in on_response callback: %s", exc)
+
     def _handle(self, message: dict) -> Outcome | None:
         if message.get("id") == self._register_id and message.get("method") is None:
             if message.get("error"):
@@ -327,11 +452,16 @@ class LinkSession:
             else:
                 self.registered_at = time.monotonic()
                 log.info("registered with the Muse")
+                if self._on_response is not None and self._sub_stream_id is None:
+                    self._schedule_sub_reconnect(delay=0.0)
             return None
-        event = message.get("event")
+        event = message.get("event") or message.get("event_name")
         if event in ("link.unpaired", "node.unpaired"):
             log.warning("the Muse removed this device")
             return Outcome.UNPAIRED
+        if event in ("delta.message_done", "message.assistant"):
+            self._handle_event_message(message)
+            return None
         if message.get("method") == "link.invoke":
             task = asyncio.ensure_future(self._invoke(message))
             self._tasks.add(task)

@@ -123,10 +123,80 @@ A few other ways to build on it:
 - **Change the SDK token.** `bash install.sh --sdk-token mgst_…` replaces it.
   It's saved in `/var/lib/musegadget/sdk_token`, readable only by root.
 
+## Spoken voice replies (TTS)
+
+You can configure your Linux Muse gadget to speak its responses aloud through
+its speaker (such as a USB speaker, 3.5mm audio jack, HDMI, or I2S DAC on a Raspberry Pi).
+
+TTS is **optional and disabled by default** to preserve existing silent behavior.
+
+### 1. Hardware
+
+Connect any standard Linux-compatible audio output device to your machine:
+- USB speaker or USB DAC
+- 3.5mm analog audio jack (Raspberry Pi 3B+/4)
+- HDMI audio output
+- I2S audio HAT (e.g. HiFiBerry, Adafruit Speaker Bonnet)
+
+Ensure your user account has permission to access the audio subsystem:
+```sh
+sudo usermod -a -G audio $USER
+```
+
+### 2. Install a TTS engine and audio utilities
+
+The easiest offline setup uses `espeak-ng` and standard ALSA playback (`aplay`):
+
+```sh
+sudo apt update && sudo apt install -y espeak-ng alsa-utils
+```
+
+### 3. Test speech
+
+Verify audio playback and synthesis directly from the command line:
+
+```sh
+musegadget say "Hello! Your Muse gadget can speak."
+```
+
+### 4. Enable TTS for the service
+
+To enable spoken replies when Muse answers, run the service with `--tts`:
+
+```sh
+musegadget run --tts
+```
+
+Or set the environment variable:
+
+```sh
+export MUSEGADGET_TTS_ENABLED=1
+```
+
+### Configuration settings
+
+| Environment Variable | Default | Description |
+|---|---|---|
+| `MUSEGADGET_TTS_ENABLED` | `0` | Enable or disable spoken replies (`1` or `0`) |
+| `MUSEGADGET_TTS_VOICE` | unset | Voice name (e.g. `en`, `en-us`) |
+| `MUSEGADGET_TTS_RATE` | unset | Speech speed (words per minute for espeak) |
+| `MUSEGADGET_AUDIO_DEVICE` | `default` | ALSA audio device name (e.g. `default`, `hw:0,0`) |
+
+### Troubleshooting
+
+- **`TTS provider 'espeak' is not installed or available`**:
+  Install espeak-ng via `sudo apt install espeak-ng`.
+- **`Audio output 'alsa' is not available`**:
+  Install ALSA playback tools via `sudo apt install alsa-utils`.
+- **`No sound heard`**:
+  Check speaker volume using `alsamixer`, or test playback with `aplay /usr/share/sounds/alsa/Front_Center.wav`.
+- **`Permission denied on audio device`**:
+  Add the account to the audio group: `sudo usermod -a -G audio <user>`.
+
 ## Manage it
 
 ```sh
-musegadget info                          # name, node id and pairing state
+musegadget info                          # name, node id, pairing and TTS state
 sudo systemctl status musegadget         # is it running?
 sudo journalctl -u musegadget -f         # follow the log
 sudo musegadget pair                     # pair again
